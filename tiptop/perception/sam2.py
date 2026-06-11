@@ -14,6 +14,7 @@ from jaxtyping import Float
 from tqdm import tqdm
 
 from tiptop.config import tiptop_cfg
+from tiptop.perception.bbox_utils import boxes_2d_to_pixel_xyxy
 from tiptop.utils import get_tiptop_cache_dir
 
 _log = logging.getLogger(__name__)
@@ -134,19 +135,9 @@ def sam2_segment_objects(
     cfg = tiptop_cfg()
     mode = cfg.perception.sam.mode
 
-    # Convert Gemini bbox format [ymin, xmin, ymax, xmax] (0-1000) to SAM2 [x0, y0, x1, y1] (pixels)
+    # Convert [ymin, xmin, ymax, xmax] (0-1000) to SAM2 [x0, y0, x1, y1] (pixels)
     img_height, img_width = rgb_pil.height, rgb_pil.width
-    boxes = np.array([
-        [
-            (xmin / 1000.0) * img_width,
-            (ymin / 1000.0) * img_height,
-            (xmax / 1000.0) * img_width,
-            (ymax / 1000.0) * img_height,
-        ]
-        for detection in detection_results
-        if len(box_2d := detection.get("box_2d", [])) == 4
-        for ymin, xmin, ymax, xmax in [box_2d]
-    ])
+    boxes = boxes_2d_to_pixel_xyxy(detection_results, img_width, img_height)
 
     _log.info(f"Segmenting {len(boxes)} objects using SAM2 in {mode} mode")
     if mode == "local":

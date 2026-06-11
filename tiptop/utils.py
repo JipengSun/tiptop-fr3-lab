@@ -180,6 +180,7 @@ def setup_logging(level: int = logging.INFO):
         "charset_normalizer",
         "curobo",
         "google_genai",
+        "openai",
         "hpack",
         "httpcore",
         "httpx",

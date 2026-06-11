@@ -250,13 +250,6 @@ class TiptopPlanningServer:
                     include_workspace=self._include_workspace,
                 )
                 perception_duration = time.monotonic() - perception_start
-            # Log camera intrinsics and pose to rerun if enabled
-            if self._rerun_mode != "disabled":
-                rr.log("cam", rr.Pinhole(image_from_camera=K))
-                rr.log(
-                    "cam",
-                    rr.Transform3D(translation=world_from_cam[:3, 3], mat3x3=world_from_cam[:3, :3], axis_length=0.05),
-                )
 
             # Run cuTAMP planning
             _log.info("Running cuTAMP planning...")

@@ -1,0 +1,44 @@
+The input image is exactly {image_width}x{image_height} pixels (width x height).
+
+Perform two tasks based on the task instruction: "{task_instruction}".
+
+TASK 1 - OBJECT DETECTION:
+Detect bounding boxes for task-relevant objects in THIS image.
+- DO NOT include the robot, robot gripper, or table surface
+- DO include containers, bins, boxes, bowls, or trays if they appear in the task instruction
+- DO NOT include irrelevant background (walls, floor, people, etc.)
+- Limit to 25 objects
+- Unique labels only (use color/size/position to disambiguate duplicates, e.g. peach_1, peach_2)
+- Each box must TIGHTLY fit the visible object. Do NOT place boxes on a regular grid.
+- box_2d format is pixel coordinates [xmin, ymin, xmax, ymax] relative to this {image_width}x{image_height} image:
+  - xmin = left edge in pixels (0 = left of image)
+  - ymin = top edge in pixels (0 = top of image)
+  - xmax = right edge in pixels (must be > xmin, max {image_width})
+  - ymax = bottom edge in pixels (must be > ymin, max {image_height})
+
+TASK 2 - TASK TRANSLATION:
+Translate the instruction into formal predicates using ONLY labels from Task 1.
+
+AVAILABLE PREDICATES:
+- on(movable, surface): Object A is placed on top of object B (both must be detected)
+- holding(movable): The robot is holding the named object
+
+IMPORTANT RULES:
+- Every object name in predicates MUST appear exactly in your bboxes list
+- For "pick X from Y" tasks, goal is holding(X) only - do not add on(...) unless placing somewhere after picking
+- Example: task "pick up the red apple" with detected red_apple -> {{"name": "holding", "args": ["red_apple"]}}
+- Example: task "place the cup on the tray" with detected cup, tray -> {{"name": "on", "args": ["cup", "tray"]}}
+
+Return a single JSON object (no code fencing):
+{{
+    "bboxes": [
+        {{"box_2d": [xmin, ymin, xmax, ymax], "label": "object_name"}},
+        ...
+    ],
+    "predicates": [
+        {{"name": "predicate_name", "args": ["object1", "object2"]}},
+        ...
+    ]
+}}
+
+Use detected labels in predicates. Only reference objects you actually detected.

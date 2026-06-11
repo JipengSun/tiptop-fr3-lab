@@ -2,7 +2,9 @@ import cv2
 import numpy as np
 from PIL import Image
 import supervision as sv
-from matplotlib import pyplot as plt, patches
+from matplotlib import pyplot as plt
+
+from tiptop.perception.bbox_utils import bbox_to_pixel_xyxy, box_2d_to_pixel_xyxy
 
 
 def match_masks_to_bboxes(masks, bboxes, img_width, img_height):
@@ -20,20 +22,16 @@ def match_masks_to_bboxes(masks, bboxes, img_width, img_height):
     # Extract 2D bounding boxes from the detection results
     bbox_coords = []
     for bbox in bboxes:
-        # Extract coordinates from the box_2d field
         if "box_2d" in bbox and len(bbox["box_2d"]) == 4:
-            # Assuming box_2d is [ymin, xmin, ymax, xmax] normalized to 0-1000
-            ymin, xmin, ymax, xmax = bbox["box_2d"]
-            # Convert to image coordinates
-            x_min = int((xmin / 1000.0) * img_width)
-            y_min = int((ymin / 1000.0) * img_height)
-            x_max = int((xmax / 1000.0) * img_width)
-            y_max = int((ymax / 1000.0) * img_height)
-            bbox_coords.append([x_min, y_min, x_max, y_max])
+            coords = box_2d_to_pixel_xyxy(bbox["box_2d"], img_width, img_height)
+            if coords is None:
+                bbox_coords.append([0, 0, 10, 10])
+            else:
+                x1, y1, x2, y2 = coords
+                bbox_coords.append([x1, y1, x2, y2])
         else:
-            # If bbox format is invalid, use a dummy bbox
             print(f"Invalid bbox format for {bbox.get('label', 'unknown')}")
-            bbox_coords.append([0, 0, 10, 10])  # Small dummy box to ensure lowest IoU
+            bbox_coords.append([0, 0, 10, 10])
 
     # Calculate IoU between each mask and each bbox to find best matches
     best_mask_indices = []
@@ -87,70 +85,43 @@ def visualize_detections(
         print("No results to visualize")
         return None
 
-    # Convert PIL image to numpy array for matplotlib
-    img_array = np.array(image)
-
-    # Create figure and axis
-    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-    ax.imshow(img_array)
-
-    # Get image dimensions for coordinate conversion
+    img_array = np.array(image).copy()
     img_height, img_width = img_array.shape[:2]
-
-    # Generate colors for different objects (using a more vibrant colormap)
     colors = plt.cm.tab20(np.linspace(0, 1, len(results)))
 
     for i, item in enumerate(results):
         box = item.get("box_2d", [])
         label = item.get("label", "Unknown")
+        coords = bbox_to_pixel_xyxy(item, img_width, img_height)
+        if coords is None:
+            if len(box) != 4:
+                continue
+            coords = box_2d_to_pixel_xyxy(box, img_width, img_height)
+        if coords is None:
+            continue
+        x1, y1, x2, y2 = coords
+        color = tuple(int(c * 255) for c in colors[i][:3])
+        cv2.rectangle(img_array, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            img_array,
+            f"{i + 1}. {label}",
+            (x1, max(15, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
 
-        if len(box) == 4:
-            # Convert normalized coordinates (0-1000) to pixel coordinates
-            ymin, xmin, ymax, xmax = box
-            ymin = (ymin / 1000.0) * img_height
-            xmin = (xmin / 1000.0) * img_width
-            ymax = (ymax / 1000.0) * img_height
-            xmax = (xmax / 1000.0) * img_width
-
-            # Create rectangle patch
-            width = xmax - xmin
-            height = ymax - ymin
-
-            rect = patches.Rectangle(
-                (xmin, ymin), width, height, linewidth=2, edgecolor=colors[i], facecolor="none", alpha=0.8
-            )
-            ax.add_patch(rect)
-
-            # Add label with background
-            ax.text(
-                xmin,
-                ymin - 5,
-                f"{i + 1}. {label}",
-                fontsize=12,
-                color="white",
-                weight="bold",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor=colors[i], alpha=0.8),
-            )
-
-    ax.axis("off")  # Hide axes
-
-    plt.tight_layout()
-
-    # Save if output path provided
-    # Use matplotlib's buffer to get the rendered image, then save with cv2 (much faster)
-    fig.canvas.draw()
-    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
     if output_path:
-        # Convert RGBA to BGR for cv2 only when saving to disk
-        buf_bgr = cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
-        cv2.imwrite(output_path, buf_bgr)
+        cv2.imwrite(output_path, cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
 
-    # Show the plot
     if show_plot:
+        plt.imshow(img_array)
+        plt.axis("off")
         plt.show()
 
-    return buf[..., :3]
+    return img_array
 
 
 def visualize_masks(rgb_pil: Image.Image, masks: np.ndarray, bboxes: list[dict]) -> np.ndarray:

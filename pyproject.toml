@@ -23,6 +23,7 @@ dependencies = [
     "bamboo-franka-client>=0.1.1",
     "dill",
     "google-genai>=0.6.0",
+    "openai>=1.0.0",
     "jaxtyping",
     "matplotlib",
     "msgpack-numpy>=0.4.8",

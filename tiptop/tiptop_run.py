@@ -41,6 +41,7 @@ from tiptop.perception.m2t2 import m2t2_to_tiptop_transform
 from tiptop.perception.sam2 import sam2_client
 from tiptop.perception.segmentation import segment_pointcloud_by_masks, segment_table_with_ransac
 from tiptop.perception.utils import convert_trimesh_box_to_curobo_cuboid, convert_trimesh_to_curobo_mesh
+from tiptop.perception.vlm_common import sanitize_grounded_atoms
 from tiptop.perception_wrapper import detect_and_segment, predict_depth_and_grasps
 from tiptop.planning import build_tamp_config, run_planning, save_tiptop_plan, serialize_plan
 from tiptop.recording import (
@@ -49,6 +50,7 @@ from tiptop.recording import (
     save_run_metadata,
     save_run_outputs,
 )
+from tiptop.rerun_utils import log_perception_to_rerun
 from tiptop.utils import (
     RobotClient,
     add_file_handler,
@@ -218,18 +220,17 @@ def _get_task_instruction() -> str:
 
 
 def create_tamp_environment(
-    object_meshes: dict[str, Mesh], table_cuboid: Cuboid, grounded_atoms: list[dict], include_workspace: bool
+    object_meshes: dict[str, Mesh],
+    table_cuboid: Cuboid,
+    grounded_atoms: list[dict],
+    include_workspace: bool,
 ) -> tuple[TAMPEnvironment, list[Cuboid | Mesh]]:
-    # Reject goals that reference objects not present in the perceived scene.
-    # Without this, cuTAMP's BFS runs without stopping, expanding the move-chain on an unreachable goal.
     known_labels = set(object_meshes.keys()) | {table_cuboid.name}
-    for atom in grounded_atoms:
-        for arg in atom.get("args", []):
-            if arg not in known_labels:
-                raise ValueError(
-                    f"Goal predicate {atom['predicate']}({', '.join(atom['args'])}) "
-                    f"references unknown object '{arg}'. Known objects: {sorted(known_labels)}"
-                )
+    if not any(atom.get("predicate") in {"on", "holding"} for atom in grounded_atoms):
+        raise ValueError(
+            f"No valid goal predicates remain after filtering. Known objects: {sorted(known_labels)}. "
+            "Try rephrasing the task or ensure the target object is visible and detected."
+        )
 
     # Identify which objects are used as surfaces (second arg in on(x, y))
     surface_labels = set()
@@ -463,8 +464,6 @@ async def run_perception(
 
     frame = observation.frame
     rgb = frame.rgb
-    if log_to_rerun:
-        rr.log("rgb", rr.Image(rgb))
 
     # Run depth+grasps and detection concurrently
     depth_results, detection_results = await asyncio.gather(
@@ -480,7 +479,7 @@ async def run_perception(
     )
     _log.info(f"Capturing observation and running perception APIs took {time.perf_counter() - start_time:.2f}s")
 
-    # Save results (ProcessPoolExecutor for live mode, default thread pool for h5 mode)
+    # Save results and process scene geometry concurrently
     loop = asyncio.get_running_loop()
     save_future = loop.run_in_executor(
         _executor_pool,
@@ -496,15 +495,6 @@ async def run_perception(
         gripper_mask,
     )
 
-    if log_to_rerun:
-        rr.log(
-            "pcd",
-            rr.Points3D(
-                positions=depth_results["xyz_map"].reshape(-1, 3), colors=depth_results["rgb_map"].reshape(-1, 3)
-            ),
-        )
-
-    # Run scene geometry processing while saving
     proc_st = time.perf_counter()
     process_coroutine = asyncio.to_thread(
         process_scene_geometry,
@@ -516,20 +506,34 @@ async def run_perception(
     )
     processed_scene, save_result = await asyncio.gather(process_coroutine, save_future)
 
+    known_labels = set(processed_scene.object_meshes.keys()) | {processed_scene.table_cuboid.name}
+    grounded_atoms = sanitize_grounded_atoms(
+        detection_results["grounded_atoms"], known_labels, task_instruction
+    )
+
     if log_to_rerun:
         bbox_viz, masks_viz = save_result
-        rr.log("bboxes", rr.Image(bbox_viz))
-        rr.log("masks", rr.Image(masks_viz))
+        log_perception_to_rerun(
+            rgb=rgb,
+            intrinsics=frame.intrinsics,
+            world_from_cam=observation.world_from_cam,
+            depth_map=depth_results["depth_map"],
+            bboxes=detection_results["bboxes"],
+            bbox_viz=bbox_viz,
+            masks_viz=masks_viz,
+            xyz_map=depth_results["xyz_map"],
+            rgb_map=depth_results["rgb_map"],
+        )
 
     env, all_surfaces = create_tamp_environment(
         processed_scene.object_meshes,
         processed_scene.table_cuboid,
-        detection_results["grounded_atoms"],
+        grounded_atoms,
         include_workspace,
     )
     _log.info(f"Processing scene and perception results took {time.perf_counter() - proc_st:.2f}s")
     _log.info(f"Perception pipeline completed, took {time.perf_counter() - start_time:.2f}s")
-    return env, all_surfaces, processed_scene, detection_results["grounded_atoms"]
+    return env, all_surfaces, processed_scene, grounded_atoms
 
 
 async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration, output_dir: str, execute_plan: bool):

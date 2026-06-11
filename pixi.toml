@@ -63,6 +63,9 @@ warp-lang = ">=0.9.0"  # required by cuRobo, easier to install via pypi for supp
 yourdfpy = ">=0.0.60"
 tiptop = { path = ".", editable = true }
 
+[activation]
+env = { LD_LIBRARY_PATH = "/usr/local/zed/lib:$LD_LIBRARY_PATH" }
+
 [tasks]
 # Installation tasks
 install-zed = "bash install/install-zed.sh"

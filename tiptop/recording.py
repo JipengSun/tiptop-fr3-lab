@@ -27,6 +27,67 @@ from tiptop.utils import NumpyEncoder
 _log = logging.getLogger(__name__)
 
 
+def save_rgb_image(rgb: UInt8[np.ndarray, "h w 3"], path: Path) -> None:
+    """Save RGB camera frame as PNG."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+
+def save_bbox_viz_image(bbox_viz: np.ndarray, path: Path) -> None:
+    """Save bounding-box overlay image as PNG."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(bbox_viz, cv2.COLOR_RGB2BGR))
+
+
+def save_mask_viz_image(masks_viz: np.ndarray, path: Path) -> None:
+    """Save segmentation mask overlay image as PNG."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(masks_viz, cv2.COLOR_RGB2BGR))
+
+
+def save_depth_colormap(depth_map: Float[np.ndarray, "h w"], path: Path) -> np.ndarray:
+    """Save a turbo colormap visualization of the depth map."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    valid = depth_map > 0
+    if not valid.any():
+        colormap = np.zeros((*depth_map.shape, 3), dtype=np.uint8)
+    else:
+        d_norm = np.zeros_like(depth_map, dtype=np.float32)
+        d_min, d_max = depth_map[valid].min(), depth_map[valid].max()
+        d_norm[valid] = (depth_map[valid] - d_min) / (d_max - d_min + 1e-9)
+        d_uint8 = (d_norm * 255).astype(np.uint8)
+        colored_bgr = cv2.applyColorMap(d_uint8, cv2.COLORMAP_TURBO)
+        colormap = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB)
+        colormap[~valid] = 0
+    cv2.imwrite(str(path), cv2.cvtColor(colormap, cv2.COLOR_RGB2BGR))
+    return colormap
+
+
+def save_scene_3d_image(pcd: o3d.geometry.PointCloud, path: Path, width: int = 960, height: int = 720) -> np.ndarray | None:
+    """Render the point cloud to a PNG snapshot for offline inspection."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if len(pcd.points) == 0:
+        _log.warning("Skipping scene_3d.png: empty point cloud")
+        return None
+    try:
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(visible=False, width=width, height=height)
+        vis.add_geometry(pcd)
+        vis.get_render_option().point_size = 2.0
+        vis.get_render_option().background_color = np.array([0.1, 0.1, 0.1])
+        vis.reset_view_point(True)
+        vis.poll_events()
+        vis.update_renderer()
+        image = np.asarray(vis.capture_screen_float_buffer(True))
+        vis.destroy_window()
+        image_uint8 = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(str(path), cv2.cvtColor(image_uint8, cv2.COLOR_RGB2BGR))
+        return image_uint8
+    except Exception:
+        _log.warning("Failed to render scene_3d.png", exc_info=True)
+        return None
+
+
 @cache
 def _get_git_root() -> Path:
     """Return the repository root."""
@@ -153,16 +214,17 @@ def save_perception_outputs(
 ):
     """Save perception outputs to disk.
 
-    Visualization files (rgb.png, bboxes_viz.png, masks_viz.png) are saved at the top
-    level of save_dir for quick access. Raw data files go into save_dir/perception/.
+    Saves on every run:
+      - rgb.png, bboxes_viz.png, masks_viz.png (top-level for quick access)
+      - perception/rgb.png, depth_colormap.png, scene_3d.png, depth.png, pointcloud.ply, etc.
     """
     start_time = time.perf_counter()
     save_dir.mkdir(parents=True, exist_ok=True)
     perception_dir = save_dir / "perception"
     perception_dir.mkdir(exist_ok=True)
 
-    # Camera image
-    cv2.imwrite(str(save_dir / "rgb.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    save_rgb_image(rgb, save_dir / "rgb.png")
+    save_rgb_image(rgb, perception_dir / "rgb.png")
 
     # Intrinsics
     intrinsics_dict = {"intrinsics": intrinsics_matrix.tolist()}
@@ -174,20 +236,28 @@ def save_perception_outputs(
     depth_mm = np.clip(depth_mm, 0, 65535)
     depth_uint16 = depth_mm.astype(np.uint16)
     cv2.imwrite(str(perception_dir / "depth.png"), depth_uint16)
+    save_depth_colormap(depth_map, perception_dir / "depth_colormap.png")
 
     # Create point cloud and write
     pcd = get_o3d_pcd(xyz_map, rgb_map)
     o3d.io.write_point_cloud(str(perception_dir / "pointcloud.ply"), pcd)
+    save_scene_3d_image(pcd, perception_dir / "scene_3d.png")
 
     # Write bboxes
     rgb_pil = Image.fromarray(rgb)
-    bbox_viz = visualize_detections(rgb_pil, bboxes, output_path=str(save_dir / "bboxes_viz.png"), show_plot=False)
+    bbox_viz = visualize_detections(rgb_pil, bboxes, output_path=None, show_plot=False)
+    if bbox_viz is not None:
+        save_bbox_viz_image(bbox_viz, save_dir / "bboxes_viz.png")
+        save_bbox_viz_image(bbox_viz, perception_dir / "bboxes_viz.png")
+    else:
+        bbox_viz = rgb.copy()
     with open(perception_dir / "bboxes.json", "w") as f:
         json.dump(bboxes, f, indent=2)
 
     # Write masks
     masks_viz = visualize_masks(rgb_pil, masks, bboxes)
-    cv2.imwrite(str(save_dir / "masks_viz.png"), cv2.cvtColor(masks_viz, cv2.COLOR_RGB2BGR))
+    save_mask_viz_image(masks_viz, save_dir / "masks_viz.png")
+    save_mask_viz_image(masks_viz, perception_dir / "masks_viz.png")
     masks_bool = masks > 0.5
     np.savez_compressed(str(perception_dir / "masks.npz"), masks_bool)  # masks are sparse so can compress
 

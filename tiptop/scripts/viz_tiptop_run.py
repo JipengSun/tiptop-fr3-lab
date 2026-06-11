@@ -19,6 +19,7 @@ from cutamp.utils.common import pose_list_to_mat4x4
 from cutamp.utils.rerun_utils import log_curobo_pose_to_rerun, curobo_to_rerun, log_curobo_mesh_to_rerun
 from tiptop.perception.m2t2 import m2t2_to_tiptop_transform
 from tiptop.planning import load_tiptop_plan
+from tiptop.rerun_utils import log_bbox_detections_to_rerun
 from tiptop.utils import get_robot_rerun, setup_logging
 from tiptop.viz_utils import get_heatmap, get_gripper_mesh
 
@@ -164,6 +165,12 @@ def viz_tiptop_run(
     rgb = Image.open(run_dir / "rgb.png")
     rr.log("cam/rgb", rr.Image(rgb), static=True)
 
+    bboxes_path = perception_dir / "bboxes.json"
+    if bboxes_path.exists():
+        with open(bboxes_path) as f:
+            bboxes = json.load(f)
+        log_bbox_detections_to_rerun(bboxes, rgb.width, rgb.height)
+
     # Mask out depth where gripper is present
     depth = cv2.imread(str(perception_dir / "depth.png"), cv2.IMREAD_UNCHANGED)
     gripper_mask_path = perception_dir / "gripper_mask.png"
@@ -174,11 +181,18 @@ def viz_tiptop_run(
         _log.warning("Gripper mask not found, using full depth")
     rr.log("cam/depth", rr.DepthImage(depth, meter=1000.0), static=True)
 
-    # Bounding boxes and mask visualization
+    # Bounding boxes and mask visualization (under cam/ for pinhole alignment)
     bboxes_viz = Image.open(run_dir / "bboxes_viz.png")
     masks_viz = Image.open(run_dir / "masks_viz.png")
-    rr.log("bboxes_viz", rr.Image(bboxes_viz), static=True)
-    rr.log("masks_viz", rr.Image(masks_viz), static=True)
+    rr.log("cam/bboxes_viz", rr.Image(bboxes_viz), static=True)
+    rr.log("cam/masks_viz", rr.Image(masks_viz), static=True)
+
+    scene_3d_path = perception_dir / "scene_3d.png"
+    if scene_3d_path.exists():
+        rr.log("scene_3d", rr.Image(Image.open(scene_3d_path)), static=True)
+    depth_colormap_path = perception_dir / "depth_colormap.png"
+    if depth_colormap_path.exists():
+        rr.log("cam/depth_colormap", rr.Image(Image.open(depth_colormap_path)), static=True)
 
     # Point cloud
     pcd = o3d.io.read_point_cloud(perception_dir / "pointcloud.ply")

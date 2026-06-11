@@ -20,28 +20,37 @@ _log = logging.getLogger(__name__)
 
 async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: str) -> dict:
     """Run VLM detection and SAM2 segmentation pipeline."""
+    from tiptop.perception.vlm import get_vlm_settings
+
     rgb_pil = Image.fromarray(rgb)
-    rgb_pil_resized = rgb_pil.resize((800, int(800 * rgb_pil.size[1] / rgb_pil.size[0])), Image.Resampling.LANCZOS)
-    _log.info(
-        f"Resized image from {rgb_pil.size[1]}x{rgb_pil.size[0]} to {rgb_pil_resized.size[1]}x{rgb_pil_resized.size[0]}"
-    )
+    provider, _ = get_vlm_settings()
+
+    # OpenAI: detect on full-res (same frame SAM uses). Gemini: resize to 800px width (legacy).
+    if provider == "openai":
+        detect_pil = rgb_pil
+    else:
+        detect_pil = rgb_pil.resize((800, int(800 * rgb_pil.size[1] / rgb_pil.size[0])), Image.Resampling.LANCZOS)
+        _log.info(
+            f"Resized image from {rgb_pil.size[1]}x{rgb_pil.size[0]} to "
+            f"{detect_pil.size[1]}x{detect_pil.size[0]} for VLM"
+        )
 
     async def _detect():
-        from tiptop.perception.gemini import detect_and_translate_async
+        from tiptop.perception.vlm import detect_and_translate_async, get_vlm_settings
 
-        _log.info(f"Starting Gemini object detection")
+        provider, model = get_vlm_settings()
+        _log.info(f"Starting VLM object detection ({provider}/{model}) on {detect_pil.size[0]}x{detect_pil.size[1]}")
         _st = time.perf_counter()
-        _bboxes, _grounded_atoms = await detect_and_translate_async(rgb_pil_resized, task_instruction)
+        _bboxes, _grounded_atoms = await detect_and_translate_async(detect_pil, task_instruction)
         _dur = time.perf_counter() - _st
-        _log.info(f"Gemini detection took {_dur:.2f}s ({len(_bboxes)} objects, {len(_grounded_atoms)} atoms)")
+        _log.info(f"VLM detection took {_dur:.2f}s ({len(_bboxes)} objects, {len(_grounded_atoms)} atoms)")
         return _bboxes, _grounded_atoms
 
     def _segment(_bboxes: list[dict]):
         from tiptop.perception.sam2 import sam2_segment_objects
 
-        _log.info(f"Starting SAM2 object segmentation with Gemini masks")
+        _log.info(f"Starting SAM2 object segmentation with VLM masks")
         _st = time.perf_counter()
-        # TODO: async version of this?
         _masks = sam2_segment_objects(rgb_pil, _bboxes)
         _dur = time.perf_counter() - _st
         _log.info(f"SAM2 segmentation took {_dur:.2f}s ({len(_masks)} masks)")
@@ -56,6 +65,10 @@ async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: 
         atom["args"] = [arg.replace(" ", "_") for arg in atom["args"]]
 
     masks = await asyncio.to_thread(_segment, bboxes)
+
+    from tiptop.perception.bbox_utils import refine_bboxes_from_masks
+
+    refine_bboxes_from_masks(bboxes, masks, rgb_pil.width, rgb_pil.height)
 
     return {"bboxes": bboxes, "masks": masks, "grounded_atoms": grounded_atoms}
 

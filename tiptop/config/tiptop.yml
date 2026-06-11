@@ -6,7 +6,7 @@ robot:
   dof: 7
 
   # IP address or hostname of the workstation running the Bamboo controller (directly networked to robot)
-  host: "your-ip-address"
+  host: "192.168.1.7"
 
   # Bamboo robot and gripper control port. You don't need to change these unless you used custom ports
   port: 5555
@@ -31,12 +31,12 @@ robot:
 cameras:
   # TiPToP only uses the hand camera for perception
   hand:
-    serial: "hand-serial"
+    serial: "10163006"
     type: zed
 
   # External camera is optional but helpful for recording execution and scene visualization script (viz-scene)
   external:
-    serial: "external-serial"
+    serial: "38845842"
     type: zed
     resolution: HD1080
     fps: 30
@@ -54,6 +54,13 @@ perception:
   
   sam:
     mode: "local"
+
+  # Vision-language model for object detection + task parsing
+  # provider: openai | gemini
+  # Set OPENAI_API_KEY or GOOGLE_API_KEY in the environment (never commit keys).
+  vlm:
+    provider: openai
+    model: gpt-4o
 
   # Perception hyperparameters
   depth_trunc_m: 5.0             # Depth truncation threshold in meters
