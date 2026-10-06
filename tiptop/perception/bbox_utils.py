@@ -55,6 +55,56 @@ def _valid_gemini_norm(box_2d: list) -> bool:
     return (ymax - ymin) * (xmax - xmin) <= 850_000
 
 
+def _all_coords_in_0_1000(raw_box: list) -> bool:
+    return len(raw_box) == 4 and all(0 <= int(round(v)) <= 1000 for v in raw_box)
+
+
+def _coords_ambiguous_between_pixel_and_gemini(raw_boxes: list[list], img_width: int, img_height: int) -> bool:
+    """True when values fit 0-1000 but the image is HD, so pixel vs gemini-norm is ambiguous."""
+    if max(img_width, img_height) <= 1000:
+        return False
+    if not raw_boxes:
+        return False
+    if any(int(round(v)) > 1000 for raw in raw_boxes for v in raw):
+        return False
+    return all(_all_coords_in_0_1000(raw) for raw in raw_boxes)
+
+
+def _box_area(box: tuple[int, int, int, int]) -> int:
+    return max(0, (box[2] - box[0]) * (box[3] - box[1]))
+
+
+def _prefer_gemini_over_pixel(raw_box: list, img_width: int, img_height: int) -> bool:
+    """Prefer 0-1000 [ymin,xmin,ymax,xmax] when pixel xyxy would shift the box too far right."""
+    if not _coords_ambiguous_between_pixel_and_gemini([raw_box], img_width, img_height):
+        return False
+    a, b, c, d = [int(round(v)) for v in raw_box]
+    px = (a, b, c, d)
+    gpx = _pixel_xyxy_from_gemini_norm([a, b, c, d], img_width, img_height)
+    if gpx is None or not _valid_pixel_xyxy(*px, img_width, img_height):
+        return False
+    # GPT-4o often returns gemini-norm coords; pixel xyxy on HD images misplaces left-side objects.
+    return px[0] > 0.25 * img_width and gpx[0] < px[0] - 50
+
+
+def _prefer_gemini_joint_layout(raw_boxes: list[list], img_width: int, img_height: int) -> bool:
+    """Jointly prefer gemini-norm when the largest pixel box is shifted right vs gemini."""
+    if not _coords_ambiguous_between_pixel_and_gemini(raw_boxes, img_width, img_height):
+        return False
+    pixel_joint: list[tuple[int, int, int, int]] = []
+    gemini_joint: list[tuple[int, int, int, int]] = []
+    for raw in raw_boxes:
+        a, b, c, d = [int(round(v)) for v in raw]
+        pixel_joint.append((a, b, c, d))
+        gpx = _pixel_xyxy_from_gemini_norm([a, b, c, d], img_width, img_height)
+        if gpx is None:
+            return False
+        gemini_joint.append(gpx)
+    pi = max(range(len(pixel_joint)), key=lambda i: _box_area(pixel_joint[i]))
+    gi = max(range(len(gemini_joint)), key=lambda i: _box_area(gemini_joint[i]))
+    return pixel_joint[pi][0] > 0.25 * img_width and gemini_joint[gi][0] < pixel_joint[pi][0] - 50
+
+
 def _score_pixel_layout(pixel_boxes: list[tuple[int, int, int, int]], img_width: int, img_height: int) -> float:
     if not pixel_boxes:
         return -1e9
@@ -77,6 +127,21 @@ def _score_pixel_layout(pixel_boxes: list[tuple[int, int, int, int]], img_width:
         if len(areas) >= 2 and max_frac > 0.03:
             score += 2.0
     return score
+
+
+def apply_gemini_norm_bboxes(bboxes: list[dict], img_width: int, img_height: int) -> None:
+    """In-place: box_2d is already [ymin, xmin, ymax, xmax] on 0-1000 grid (no format guessing)."""
+    for bbox in bboxes:
+        raw = bbox.get("box_2d", [])
+        if len(raw) != 4:
+            continue
+        ymin, xmin, ymax, xmax = [int(round(v)) for v in raw]
+        gemini = [ymin, xmin, ymax, xmax]
+        pixels = _pixel_xyxy_from_gemini_norm(gemini, img_width, img_height)
+        bbox["box_2d_raw"] = gemini
+        bbox["box_2d"] = gemini
+        bbox["box_2d_pixels"] = list(pixels) if pixels else []
+        bbox["box_2d_format"] = "gemini_norm"
 
 
 def parse_openai_box_2d(raw_box: list, img_width: int, img_height: int) -> tuple[list, list[int], str]:
@@ -119,7 +184,12 @@ def parse_openai_box_2d(raw_box: list, img_width: int, img_height: int) -> tuple
         _log.warning(f"Could not parse OpenAI box {raw_box}; passing through unchanged")
         return raw_box, [], "unknown"
 
-    fmt, gemini, pixels, _ = max(candidates, key=lambda item: item[3])
+    def _rank(item: tuple[str, list, list[int], float]) -> tuple[float, int]:
+        fmt, _, _, score = item
+        prefer_gemini = 1 if fmt == "gemini_norm" and _prefer_gemini_over_pixel(raw_box, img_width, img_height) else 0
+        return (score, prefer_gemini)
+
+    fmt, gemini, pixels, _ = max(candidates, key=_rank)
     return gemini, pixels, fmt
 
 
@@ -147,14 +217,24 @@ def normalize_openai_bboxes(bboxes: list[dict], img_width: int, img_height: int)
             break
         pixel_joint.append(px)
 
-    use_joint_pixels = pixel_valid and _score_pixel_layout(pixel_joint, img_width, img_height) >= _score_pixel_layout(
-        parsed_pixels, img_width, img_height
-    ) - 0.5
+    prefer_gemini_joint = _prefer_gemini_joint_layout(all_raw, img_width, img_height)
+    use_joint_pixels = (
+        pixel_valid
+        and not prefer_gemini_joint
+        and _score_pixel_layout(pixel_joint, img_width, img_height)
+        >= _score_pixel_layout(parsed_pixels, img_width, img_height) - 0.5
+    )
 
     for bbox, gemini, pixels, fmt in parsed_entries:
         raw = bbox.get("box_2d", [])
         bbox["box_2d_raw"] = raw
-        if use_joint_pixels and len(raw) == 4:
+        if prefer_gemini_joint and len(raw) == 4:
+            a, b, c, d = [int(round(v)) for v in raw]
+            gemini = [a, b, c, d]
+            gpx = _pixel_xyxy_from_gemini_norm(gemini, img_width, img_height)
+            pixels = list(gpx) if gpx else pixels
+            fmt = "gemini_norm"
+        elif use_joint_pixels and len(raw) == 4:
             a, b, c, d = [int(round(v)) for v in raw]
             pixels = [a, b, c, d]
             gemini = _gemini_norm_from_pixel_xyxy(a, b, c, d, img_width, img_height)

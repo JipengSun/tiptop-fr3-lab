@@ -183,8 +183,11 @@ class ZedCamera:
             _log.info("Stopped recording")
 
     def close(self):
-        self.stop_recording()
-        self._cam.close()
+        try:
+            self.stop_recording()
+            self._cam.close()
+        except Exception as e:
+            _log.warning(f"Error closing ZED camera {self.serial}: {e}")
 
 
 def zed_infer_depth(
@@ -231,6 +234,215 @@ async def zed_infer_depth_async(
         baseline=intrinsics.baseline,
     )
     return depth
+
+
+def read_svo_timestamps(svo_path: Path) -> list[int]:
+    """Return IMAGE timestamps (ms) for every frame in an SVO file."""
+    import pyzed.sl as sl
+
+    if not svo_path.exists():
+        raise FileNotFoundError(f"SVO file not found: {svo_path}")
+
+    init_params = sl.InitParameters()
+    init_params.set_from_svo_file(str(svo_path))
+    init_params.svo_real_time_mode = False
+    zed = sl.Camera()
+    err = zed.open(init_params)
+    if err != sl.ERROR_CODE.SUCCESS:
+        raise RuntimeError(f"Failed to open SVO file: {err}")
+
+    rt_param = sl.RuntimeParameters()
+    timestamps: list[int] = []
+    try:
+        while True:
+            err = zed.grab(rt_param)
+            if err == sl.ERROR_CODE.SUCCESS:
+                timestamps.append(zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds())
+            elif err == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
+                break
+            else:
+                raise RuntimeError(f"Failed to grab frame at position {zed.get_svo_position()}: {err}")
+    finally:
+        zed.close()
+    return timestamps
+
+
+def convert_svo_to_mp4_resampled(
+    svo_path: Path,
+    mp4_path: Path,
+    sample_times_ms: list[int],
+    frame_timestamps_ms: list[int],
+    output_fps: int,
+    crf: int = 20,
+) -> None:
+    """Convert SVO to MP4 by resampling frames onto a shared timestamp grid."""
+    import shutil
+    import subprocess
+
+    import pyzed.sl as sl
+
+    if not frame_timestamps_ms:
+        raise RuntimeError(f"SVO has no frames: {svo_path}")
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found on PATH, required for SVO to MP4 conversion")
+
+    init_params = sl.InitParameters()
+    init_params.set_from_svo_file(str(svo_path))
+    init_params.svo_real_time_mode = False
+    zed = sl.Camera()
+    err = zed.open(init_params)
+    if err != sl.ERROR_CODE.SUCCESS:
+        raise RuntimeError(f"Failed to open SVO file: {err}")
+
+    image_size = zed.get_camera_information().camera_configuration.resolution
+    width = image_size.width
+    height = image_size.height
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(output_fps),
+        "-i",
+        "pipe:0",
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+        str(mp4_path),
+    ]
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    left_image = sl.Mat()
+    rt_param = sl.RuntimeParameters()
+    frame_idx = 0
+    try:
+        if zed.grab(rt_param) != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Failed to read first frame from {svo_path}")
+
+        with tqdm(total=len(sample_times_ms), desc=f"Syncing {svo_path.name}", unit="frame") as pbar:
+            for target_t in sample_times_ms:
+                while frame_idx < len(frame_timestamps_ms) - 1 and frame_timestamps_ms[frame_idx + 1] <= target_t:
+                    frame_idx += 1
+                    if zed.grab(rt_param) != sl.ERROR_CODE.SUCCESS:
+                        break
+
+                zed.retrieve_image(left_image, sl.VIEW.LEFT)
+                frame_bgr = cv2.cvtColor(left_image.get_data(), cv2.COLOR_BGRA2BGR)
+                try:
+                    proc.stdin.write(frame_bgr.tobytes())
+                except BrokenPipeError:
+                    break
+                pbar.update(1)
+    finally:
+        proc.stdin.close()
+        stderr = proc.stderr.read()
+        proc.wait()
+        zed.close()
+
+    if proc.returncode != 0:
+        stderr_msg = stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"ffmpeg exited with code {proc.returncode}: {stderr_msg}")
+
+
+# How far behind the last camera a stream may stop before it is called a failure rather than
+# jitter. Two healthy ZEDs stop within ~30 ms of each other; a grab loop that died mid-run is
+# out by tens of seconds. A second sits well clear of both.
+EARLY_STOP_WARN_MS = 1000
+
+
+def convert_svos_to_mp4_synced(
+    items: list[tuple[Path, Path]],
+    output_fps: int = 30,
+    crf: int = 20,
+) -> dict:
+    """Convert multiple SVO files to MP4, resampled to a shared timestamp grid."""
+    if not items:
+        return {}
+
+    timestamp_lists = [read_svo_timestamps(svo_path) for svo_path, _ in items]
+    if any(not ts for ts in timestamp_lists):
+        raise RuntimeError("One or more SVO recordings contain no frames")
+
+    t_start = max(ts[0] for ts in timestamp_lists)
+    # Union, not intersection. A camera whose grab loop dies mid-run ends its SVO early, and
+    # clipping the grid to min(last) discards every second the *healthy* cameras went on
+    # recording -- footage that is sitting in their .svo2 masters and was never lost, only
+    # thrown away here. The grid runs to the last frame any camera captured; one that stopped
+    # sooner holds its final frame for the tail, so frame i of every .mp4 is still the same
+    # wall-clock instant.
+    t_end = max(ts[-1] for ts in timestamp_lists)
+    if t_end <= t_start:
+        _log.warning("No overlapping SVO timestamp window; falling back to unsynced conversion")
+        for svo_path, mp4_path in items:
+            convert_svo_to_mp4(svo_path, mp4_path, crf=crf)
+        return {}
+
+    duration_ms = t_end - t_start
+    n_frames = max(1, int(duration_ms * output_fps / 1000) + 1)
+    sample_times = [t_start + int(i * 1000 / output_fps) for i in range(n_frames)]
+
+    sync_meta = {
+        "output_fps": output_fps,
+        "t_start_ms": t_start,
+        "t_end_ms": t_end,
+        "n_frames": n_frames,
+        "cameras": {},
+    }
+
+    for (svo_path, mp4_path), timestamps in zip(items, timestamp_lists):
+        _log.info(
+            "Syncing %s (%d SVO frames, offset %+d ms vs grid start)",
+            svo_path.name,
+            len(timestamps),
+            timestamps[0] - t_start,
+        )
+        # Frames past this camera's own last timestamp are the held tail described above.
+        n_real = sum(1 for t in sample_times if t <= timestamps[-1])
+        ended_early_ms = t_end - timestamps[-1]
+        sync_meta["cameras"][mp4_path.stem] = {
+            "svo_path": svo_path.name,
+            "first_ts_ms": timestamps[0],
+            "last_ts_ms": timestamps[-1],
+            "n_svo_frames": len(timestamps),
+            "start_offset_ms": timestamps[0] - t_start,
+            "n_real_frames": n_real,
+            "held_tail_frames": n_frames - n_real,
+            "ended_early_ms": ended_early_ms,
+        }
+        if ended_early_ms > EARLY_STOP_WARN_MS:
+            # Loud, because the run itself carried on and looked fine: the operator only
+            # finds out later that one angle stops mid-motion.
+            _log.warning(
+                "%s stopped recording %.1fs before the other camera(s) did -- %d of %d frames "
+                "are real and the rest hold its last frame. Its grab loop died mid-run; check "
+                "the run log for 'Error grabbing frame during recording'.",
+                svo_path.name,
+                ended_early_ms / 1000,
+                n_real,
+                n_frames,
+            )
+        convert_svo_to_mp4_resampled(
+            svo_path,
+            mp4_path,
+            sample_times,
+            timestamps,
+            output_fps,
+            crf=crf,
+        )
+
+    return sync_meta
 
 
 def convert_svo_to_mp4(svo_path: Path, mp4_path: Path, crf: int = 20):

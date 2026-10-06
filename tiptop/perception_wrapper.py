@@ -8,6 +8,7 @@ from jaxtyping import Bool, Float, UInt8
 from PIL import Image
 
 from tiptop.config import tiptop_cfg
+from tiptop.orange_demo import ground_four_orange_instruction
 from tiptop.perception.cameras import (
     DepthEstimator,
     Frame,
@@ -17,6 +18,23 @@ from tiptop.perception.utils import depth_to_xyz, get_o3d_pcd
 
 _log = logging.getLogger(__name__)
 
+# VLM detection width (aspect ratio preserved). 0-1000 bbox grid maps to full-res SAM frame.
+_VLM_DETECT_WIDTH = 800
+
+
+def _vlm_detect_image(rgb_pil: Image.Image) -> Image.Image:
+    if rgb_pil.width <= _VLM_DETECT_WIDTH:
+        return rgb_pil
+    detect_pil = rgb_pil.resize(
+        (_VLM_DETECT_WIDTH, int(_VLM_DETECT_WIDTH * rgb_pil.size[1] / rgb_pil.size[0])),
+        Image.Resampling.LANCZOS,
+    )
+    _log.info(
+        f"Resized image from {rgb_pil.size[1]}x{rgb_pil.size[0]} to "
+        f"{detect_pil.size[1]}x{detect_pil.size[0]} for VLM"
+    )
+    return detect_pil
+
 
 async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: str) -> dict:
     """Run VLM detection and SAM2 segmentation pipeline."""
@@ -24,16 +42,7 @@ async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: 
 
     rgb_pil = Image.fromarray(rgb)
     provider, _ = get_vlm_settings()
-
-    # OpenAI: detect on full-res (same frame SAM uses). Gemini: resize to 800px width (legacy).
-    if provider == "openai":
-        detect_pil = rgb_pil
-    else:
-        detect_pil = rgb_pil.resize((800, int(800 * rgb_pil.size[1] / rgb_pil.size[0])), Image.Resampling.LANCZOS)
-        _log.info(
-            f"Resized image from {rgb_pil.size[1]}x{rgb_pil.size[0]} to "
-            f"{detect_pil.size[1]}x{detect_pil.size[0]} for VLM"
-        )
+    detect_pil = _vlm_detect_image(rgb_pil)
 
     async def _detect():
         from tiptop.perception.vlm import detect_and_translate_async, get_vlm_settings
@@ -58,11 +67,25 @@ async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: 
 
     bboxes, grounded_atoms = await _detect()
 
+    # Map 0-1000 VLM boxes to full-res pixel coords for SAM (aspect ratio preserved at detect width).
+    from tiptop.perception.bbox_utils import apply_gemini_norm_bboxes
+
+    apply_gemini_norm_bboxes(bboxes, rgb_pil.width, rgb_pil.height)
+
     # Sanitize labels: replace spaces with underscores for downstream compatibility
     for bbox in bboxes:
         bbox["label"] = bbox["label"].replace(" ", "_")
     for atom in grounded_atoms:
         atom["args"] = [arg.replace(" ", "_") for arg in atom["args"]]
+
+    orange_grounding = ground_four_orange_instruction(bboxes, grounded_atoms, task_instruction)
+    bboxes = orange_grounding.bboxes
+    grounded_atoms = orange_grounding.grounded_atoms
+    if orange_grounding.selected_label is not None:
+        _log.info(
+            f"Grounded {orange_grounding.selector.description!r} as {orange_grounding.selected_label}; "
+            f"goal={grounded_atoms}"
+        )
 
     masks = await asyncio.to_thread(_segment, bboxes)
 
@@ -70,7 +93,12 @@ async def detect_and_segment(rgb: UInt8[np.ndarray, "h w 3"], task_instruction: 
 
     refine_bboxes_from_masks(bboxes, masks, rgb_pil.width, rgb_pil.height)
 
-    return {"bboxes": bboxes, "masks": masks, "grounded_atoms": grounded_atoms}
+    return {
+        "bboxes": bboxes,
+        "masks": masks,
+        "grounded_atoms": grounded_atoms,
+        "orange_grounding": orange_grounding,
+    }
 
 
 async def predict_depth_and_grasps(

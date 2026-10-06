@@ -1,9 +1,12 @@
+import logging
 from typing import Awaitable, Callable, Protocol
 
 import aiohttp
 import numpy as np
 
 from tiptop.config import tiptop_cfg
+
+_log = logging.getLogger(__name__)
 from tiptop.perception.cameras.frame import Frame
 from tiptop.perception.cameras.rs_camera import (
     RealsenseCamera,
@@ -69,14 +72,35 @@ def get_hand_camera(depth: bool = False) -> Camera:
         raise ValueError(f"Unknown camera type: {cam_type}")
 
 
-def get_external_camera() -> Camera:
-    """Get the external camera by serial number."""
+def get_external_camera() -> Camera | None:
+    """Get the external camera by serial number, or None if not configured / unavailable.
+
+    TiPToP perception uses only the hand camera; external is optional (recording / viz-scene).
+    """
     cfg = tiptop_cfg()
-    cam_cfg = cfg.cameras.external
+    cam_cfg = cfg.cameras.get("external")
+    if cam_cfg is None:
+        return None
+
+    serial = str(cam_cfg.get("serial", "")).strip()
+    if not serial or serial in {"external-serial", "none", "null"}:
+        _log.info("No external camera configured — skipping")
+        return None
+
     cam_type = cam_cfg.type
-    if cam_type == "zed":
-        return _get_zed_camera(cam_cfg)
-    elif cam_type == "realsense":
-        return RealsenseCamera(str(cam_cfg.serial))
-    else:
-        raise ValueError(f"Unknown camera type: {cam_type}")
+    try:
+        if cam_type == "zed":
+            return _get_zed_camera(cam_cfg)
+        elif cam_type == "realsense":
+            return RealsenseCamera(serial)
+        else:
+            raise ValueError(f"Unknown camera type: {cam_type}")
+    except RuntimeError as e:
+        _log.warning(
+            "External camera %s failed to open (%s) — continuing without it. "
+            "Perception uses the hand camera only. Plug in the external ZED or set "
+            "cameras.external.serial to empty in tiptop.yml.",
+            serial,
+            e,
+        )
+        return None

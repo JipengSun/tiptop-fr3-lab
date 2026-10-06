@@ -55,7 +55,7 @@ def infer_depth(
 
     infer_endpoint = os.path.join(server_url.rstrip("/"), "infer")
     _log.debug(f"Sending inference request to FoundationStereo server at {infer_endpoint}")
-    response = requests.post(infer_endpoint, files=files, data=data)
+    response = requests.post(infer_endpoint, files=files, data=data, timeout=300)
     if response.status_code != 200:
         raise RuntimeError(
             f"FoundationStereo request failed with status code {response.status_code}. Response: {response.text}"
@@ -99,7 +99,7 @@ async def infer_depth_async(
     infer_endpoint = os.path.join(server_url.rstrip("/"), "infer")
     _log.debug(f"Sending inference request to FoundationStereo server at {infer_endpoint}")
 
-    async with session.post(infer_endpoint, data=data, timeout=aiohttp.ClientTimeout(total=10.0)) as response:
+    async with session.post(infer_endpoint, data=data, timeout=aiohttp.ClientTimeout(total=300.0)) as response:
         if response.status != 200:
             text = await response.text()
             raise RuntimeError(f"FoundationStereo request failed with status code {response.status}. Response: {text}")

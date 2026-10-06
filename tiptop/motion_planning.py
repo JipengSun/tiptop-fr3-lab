@@ -28,7 +28,7 @@ from cutamp.utils.common import sample_between_bounds
 from jaxtyping import Float
 
 from tiptop.config import tiptop_cfg
-from tiptop.utils import get_robot_client, patch_log_level
+from tiptop.utils import RobotClient, get_robot_client, patch_log_level
 from tiptop.workspace import workspace_cuboids
 
 _log = logging.getLogger(__name__)
@@ -173,6 +173,7 @@ def go_to_q(
     time_dilation_factor: float,
     dist_tol: float = 0.05,
     motion_gen: MotionGen | None = None,
+    client: RobotClient | None = None,
 ) -> None:
     """Move the robot to the target joint positions using motion planning against the workspace."""
     dof = tiptop_cfg().robot.dof
@@ -185,7 +186,8 @@ def go_to_q(
     if not 0 < time_dilation_factor <= 1:
         raise ValueError(f"time_dilation_factor must be between 0 and 1, but got {time_dilation_factor}")
 
-    client = get_robot_client()
+    if client is None:
+        client = get_robot_client()
     if motion_gen is None:
         _log.debug(f"Getting MotionGen")
         world_cfg = WorldConfig(cuboid=list(workspace_cuboids()))
@@ -196,9 +198,10 @@ def go_to_q(
     q_target = tensor_args.to_device(q_target)
 
     # If we're already close to the target, then nothing to do
-    dist = torch.norm(q_start - q_target)
+    dist = torch.norm(q_start - q_target).item()
+    _log.info(f"Joint distance to target: {dist:.3f} rad (tol={dist_tol})")
     if dist <= dist_tol:
-        _log.info(f"Robot already at target joint positions with {dist=:.2f}")
+        _log.info("Robot already at target joint positions — skipping motion")
         return
 
     # Motion plan!
@@ -218,24 +221,42 @@ def go_to_q(
 
     # Execute on the robot
     plan = result.interpolated_plan
+    n_waypoints = plan.position.shape[0]
+    if n_waypoints == 0:
+        raise RuntimeError("Motion plan succeeded but produced zero waypoints — cannot execute.")
+    _log.info(f"Executing {n_waypoints} waypoints on robot (dt={result.interpolation_dt:.3f}s)...")
     dt = result.interpolation_dt
-    timings = [dt] * plan.position.shape[0]
-    result = client.execute_joint_impedance_path(
+    timings = [dt] * n_waypoints
+    exec_result = client.execute_joint_impedance_path(
         joint_confs=plan.position.cpu().numpy(), joint_vels=plan.velocity.cpu().numpy(), durations=timings
     )
-    client.close()
-    if not result["success"]:
-        raise RuntimeError(f"Failed to execute trajectory on robot. {result['error']}")
+    # Do not close the client — get_robot_client() is a cached singleton shared with the demo container.
+    if not exec_result["success"]:
+        raise RuntimeError(f"Failed to execute trajectory on robot. {exec_result['error']}")
     _log.info("Executed trajectory on the robot")
 
 
-def go_to_home(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> None:
+def go_to_home(
+    time_dilation_factor: float, motion_gen: MotionGen | None = None, client: RobotClient | None = None
+) -> None:
     """Go to home configuration"""
     cfg = tiptop_cfg()
-    go_to_q(q_target=list(cfg.robot.q_home), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+    go_to_q(
+        q_target=list(cfg.robot.q_home),
+        time_dilation_factor=time_dilation_factor,
+        motion_gen=motion_gen,
+        client=client,
+    )
 
 
-def go_to_capture(time_dilation_factor: float, motion_gen: MotionGen | None = None) -> None:
+def go_to_capture(
+    time_dilation_factor: float, motion_gen: MotionGen | None = None, client: RobotClient | None = None
+) -> None:
     """Go to capture configuration"""
     cfg = tiptop_cfg()
-    go_to_q(q_target=list(cfg.robot.q_capture), time_dilation_factor=time_dilation_factor, motion_gen=motion_gen)
+    go_to_q(
+        q_target=list(cfg.robot.q_capture),
+        time_dilation_factor=time_dilation_factor,
+        motion_gen=motion_gen,
+        client=client,
+    )

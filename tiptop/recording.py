@@ -19,7 +19,7 @@ from PIL import Image
 
 import tiptop
 from tiptop.config import get_tiptop_cfg_path
-from tiptop.perception.cameras.zed_camera import ZedCamera, convert_svo_to_mp4
+from tiptop.perception.cameras.zed_camera import ZedCamera, convert_svo_to_mp4, convert_svos_to_mp4_synced
 from tiptop.perception.utils import get_o3d_pcd
 from tiptop.perception.visualization import visualize_detections, visualize_masks
 from tiptop.utils import NumpyEncoder
@@ -91,12 +91,16 @@ def save_scene_3d_image(pcd: o3d.geometry.PointCloud, path: Path, width: int = 9
 @cache
 def _get_git_root() -> Path:
     """Return the repository root."""
-    return Path(subprocess.check_output(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=Path(__file__).parent,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    ).strip())
+    return Path(
+        subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=Path(__file__).parent,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+    )
 
 
 def _collect_git_info() -> dict:
@@ -111,12 +115,16 @@ def _collect_git_info() -> dict:
             cwd=root,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         ).strip()
         porcelain = subprocess.check_output(
             ["git", "status", "--porcelain", "--", ".", ":(exclude)pixi.lock"],
             cwd=root,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         dirty = bool(porcelain.strip())
         return {"commit": commit, "dirty": dirty, "porcelain": porcelain.strip() if dirty else None}
@@ -134,30 +142,49 @@ def _get_git_diff() -> str | None:
             cwd=root,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return diff if diff else None
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError):
         _log.warning("Failed to get git diff", exc_info=True)
         return None
+
+
+def _resolve_svo_path(svo_path: Path) -> Path:
+    if svo_path.exists():
+        return svo_path
+    svo2_path = svo_path.with_suffix(".svo2")
+    if svo2_path.exists():
+        _log.debug(f"SVO actually written by ZED SDK to {svo2_path.name}")
+        return svo2_path
+    raise FileNotFoundError(f"Recording failed: SVO file not found at {svo_path} or {svo2_path}")
 
 
 @contextmanager
 def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Generator[None, None, None]:
     """Context manager for recording multiple ZED cameras simultaneously.
 
-    All cameras stop collecting frames at the same time on exit, then MP4
-    conversion runs sequentially afterwards.
+    All cameras start/stop on the same barrier, then MP4 conversion resamples
+    SVO timestamps onto a shared grid so multi-camera videos stay aligned.
 
     Args:
         recordings: List of (camera, svo_path, mp4_path) tuples
     """
     stop_events: list[threading.Event] = []
     threads: list[threading.Thread] = []
+    start_barrier = threading.Barrier(len(recordings)) if recordings else None
+
+    for camera, svo_path, _ in recordings:
+        camera.start_recording(str(svo_path))
+        _log.info(f"Armed recording for camera {camera.serial} → {svo_path}")
 
     for camera, svo_path, _ in recordings:
         stop_event = threading.Event()
 
-        def recording_loop(cam=camera, event=stop_event):
+        def recording_loop(cam=camera, event=stop_event, barrier=start_barrier):
+            if barrier is not None:
+                barrier.wait()
             while not event.is_set():
                 try:
                     cam.read_camera()
@@ -165,40 +192,37 @@ def record_cameras(recordings: list[tuple[ZedCamera, Path, Path | None]]) -> Gen
                     _log.error(f"Error grabbing frame during recording: {e}")
                     break
 
-        camera.start_recording(str(svo_path))
-        thread = threading.Thread(target=recording_loop)
+        thread = threading.Thread(target=recording_loop, daemon=True)
         thread.start()
-        _log.info(f"Started recording camera {camera.serial} to {svo_path}")
+        _log.info(f"Started grab loop for camera {camera.serial}")
         stop_events.append(stop_event)
         threads.append(thread)
 
     try:
         yield
     finally:
-        # Signal all cameras to stop simultaneously so recordings are the same length
         for event in stop_events:
             event.set()
         for (camera, svo_path, _), thread in zip(recordings, threads):
-            thread.join(timeout=3.0)
+            thread.join(timeout=5.0)
             camera.stop_recording()
             _log.info(f"Stopped recording camera {camera.serial}")
 
-        # Convert to MP4 after all cameras have stopped
-        for camera, svo_path, mp4_path in recordings:
+        mp4_items: list[tuple[Path, Path]] = []
+        for _camera, svo_path, mp4_path in recordings:
             if mp4_path is None:
                 continue
-            actual_svo_path = svo_path
-            if not svo_path.exists():
-                svo2_path = svo_path.with_suffix(".svo2")
-                if svo2_path.exists():
-                    _log.debug(f"SVO actually written by ZED SDK to {svo2_path.name}")
-                    actual_svo_path = svo2_path
-            if actual_svo_path.exists():
-                convert_svo_to_mp4(actual_svo_path, mp4_path)
-            else:
-                raise FileNotFoundError(
-                    f"Recording failed: SVO file not found at {svo_path} or {svo_path.with_suffix('.svo2')}"
-                )
+            mp4_items.append((_resolve_svo_path(svo_path), mp4_path))
+
+        if len(mp4_items) >= 2:
+            sync_meta = convert_svos_to_mp4_synced(mp4_items)
+            if sync_meta:
+                sync_path = mp4_items[0][1].parent / "recording_sync.json"
+                sync_path.write_text(json.dumps(sync_meta, indent=2))
+                _log.info(f"Wrote sync metadata to {sync_path}")
+        else:
+            for svo_path, mp4_path in mp4_items:
+                convert_svo_to_mp4(svo_path, mp4_path)
 
 
 def save_perception_outputs(

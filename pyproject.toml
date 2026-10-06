@@ -89,6 +89,7 @@ gripper-close = "tiptop.scripts.gripper_actuate:gripper_close_entrypoint"
 
 # Main tiptop demo
 tiptop-run = "tiptop.tiptop_run:entrypoint"
+tiptop-orange-check = "tiptop.scripts.orange_demo_check:main"
 
 # Offline tiptop (no real robot)
 tiptop-h5 = "tiptop.tiptop_offline:h5_entrypoint"

@@ -18,8 +18,9 @@ robot:
   # We use 0.6 on our setup at MIT, where we have managed the camera USB cable carefully
   time_dilation_factor: 0.2
 
-  # Robot configurations
-  q_home: [0.0, -0.628, 0.0, -2.513, 0.0, 1.885, 0.0]
+  # Lab home = wrist-cam capture pose (table view used by tiptop-run).
+  # Old tuck/neutral was [0.0, -0.628, 0.0, -2.513, 0.0, 1.885, 0.0].
+  q_home: [-0.034, 0.090, 0.080, -1.319, -0.003, 1.253, 0.030]
   q_capture: [-0.034, 0.090, 0.080, -1.319, -0.003, 1.253, 0.030]
 
 # == Camera configurations ==
@@ -55,12 +56,11 @@ perception:
   sam:
     mode: "local"
 
-  # Vision-language model for object detection + task parsing
-  # provider: openai | gemini
-  # Set OPENAI_API_KEY or GOOGLE_API_KEY in the environment (never commit keys).
+  # Vision-language model: Gemini only (lab default)
+  # Set GOOGLE_API_KEY in tiptop/.env (gitignored) or environment.
   vlm:
-    provider: openai
-    model: gpt-4o
+    provider: gemini
+    model: gemini-robotics-er-1.6-preview
 
   # Perception hyperparameters
   depth_trunc_m: 5.0             # Depth truncation threshold in meters

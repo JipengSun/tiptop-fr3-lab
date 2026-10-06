@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import logging
 import os
@@ -9,16 +8,23 @@ from pathlib import Path
 from PIL import Image
 from openai import AsyncOpenAI, OpenAI
 
-from tiptop.perception.bbox_utils import boxes_containment_score, normalize_openai_bboxes
-from tiptop.perception.vlm_common import (
-    load_json,
-    load_prompt,
-    parse_detect_and_translate_response,
-)
+from tiptop.perception.bbox_utils import apply_gemini_norm_bboxes, boxes_containment_score
+from tiptop.perception.openai_schemas import BboxListResponse, DetectAndTranslateResponse, DetectedBBox
+from tiptop.perception.vlm_common import load_prompt
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gpt-4o"
+# gpt-4o alias does not support Structured Outputs; use a dated snapshot or gpt-4.1.
+DEFAULT_MODEL = "gpt-4o-2024-08-06"
+STRUCTURED_OUTPUT_MODELS = {
+    "gpt-4o-2024-08-06",
+    "gpt-4o-2024-11-20",
+    "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+}
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
@@ -54,6 +60,12 @@ def openai_async_client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key=api_key)
 
 
+def _supports_structured_outputs(model_id: str) -> bool:
+    if model_id in STRUCTURED_OUTPUT_MODELS:
+        return True
+    return model_id.startswith("gpt-4.1") or "2024-08" in model_id or "2024-11" in model_id
+
+
 def _pil_to_data_url(image: Image.Image) -> str:
     buf = BytesIO()
     image.convert("RGB").save(buf, format="PNG")
@@ -61,39 +73,48 @@ def _pil_to_data_url(image: Image.Image) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def _image_content(image: Image.Image, prompt: str) -> list:
+def _vision_user_content(image: Image.Image, prompt: str) -> list:
     return [
         {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": _pil_to_data_url(image), "detail": "high"}},
+        {
+            "type": "image_url",
+            "image_url": {"url": _pil_to_data_url(image), "detail": "high"},
+        },
     ]
 
 
-def _openai_detect_prompt(image: Image.Image, task_instruction: str) -> str:
-    w, h = image.size
-    return load_prompt("detect_and_translate_openai").format(
-        task_instruction=task_instruction,
-        image_width=w,
-        image_height=h,
-    )
+def _detect_prompt(task_instruction: str) -> str:
+    return load_prompt("detect_and_translate").format(task_instruction=task_instruction)
 
 
-def _normalize_openai_bboxes(result: list | dict, img_width: int, img_height: int) -> None:
-    if isinstance(result, dict):
-        items = result.get("bboxes", [])
-    else:
-        items = result
-    normalize_openai_bboxes(items, img_width, img_height)
-
-
-def _spatial_retry_prompt(base_prompt: str, task_instruction: str) -> str:
+def _spatial_retry_suffix(task_instruction: str) -> str:
     return (
-        f"{base_prompt}\n\n"
-        "IMPORTANT CORRECTION: Your previous bounding boxes were spatially inconsistent. "
-        f"Re-check the image carefully for task: {task_instruction!r}. "
-        "Return pixel coordinates [xmin, ymin, xmax, ymax] that TIGHTLY fit each object. "
-        "If the task mentions an object inside a box/container, the inner object boxes must lie "
-        "fully inside the container box."
+        "\n\nIMPORTANT CORRECTION: Previous boxes were spatially wrong. "
+        f"Re-check the image for task: {task_instruction!r}. "
+        "Each box must TIGHTLY fit its object on the 1000x1000 grid. "
+        "If the task mentions an object inside a container, inner boxes must lie fully inside the container."
     )
+
+
+def _structured_bbox_to_dict(det: DetectedBBox) -> dict:
+    return {
+        "label": det.label,
+        "box_2d": [det.ymin, det.xmin, det.ymax, det.xmax],
+    }
+
+
+def _response_to_bboxes_and_atoms(parsed: DetectAndTranslateResponse) -> tuple[list[dict], list[dict]]:
+    bboxes = [_structured_bbox_to_dict(b) for b in parsed.bboxes]
+    grounded_atoms = [
+        {"predicate": spec.name, "args": spec.args}
+        for spec in parsed.predicates
+        if spec.name and spec.args
+    ]
+    return bboxes, grounded_atoms
+
+
+def _finalize_bboxes(bboxes: list[dict], img_width: int, img_height: int) -> None:
+    apply_gemini_norm_bboxes(bboxes, img_width, img_height)
 
 
 def _maybe_retry_for_containment(
@@ -112,11 +133,9 @@ def _maybe_retry_for_containment(
     if score >= 1.0:
         return bboxes, grounded_atoms
     _log.warning(f"OpenAI boxes failed container containment ({score:.0%}); retrying detection once")
-    retry_prompt = _spatial_retry_prompt(prompt, task_instruction)
-    response_text = _generate_vision_json(image, retry_prompt, model_id=model_id, temperature=temperature)
-    bboxes, grounded_atoms = parse_detect_and_translate_response(response_text, "OpenAI")
-    _normalize_openai_bboxes(bboxes, image.size[0], image.size[1])
-    return bboxes, grounded_atoms
+    return _detect_and_translate_structured(
+        image, prompt + _spatial_retry_suffix(task_instruction), model_id, temperature
+    )
 
 
 async def _maybe_retry_for_containment_async(
@@ -135,61 +154,119 @@ async def _maybe_retry_for_containment_async(
     if score >= 1.0:
         return bboxes, grounded_atoms
     _log.warning(f"OpenAI boxes failed container containment ({score:.0%}); retrying detection once")
-    retry_prompt = _spatial_retry_prompt(prompt, task_instruction)
-    response_text = await _generate_vision_json_async(
-        image, retry_prompt, model_id=model_id, temperature=temperature
+    return await _detect_and_translate_structured_async(
+        image, prompt + _spatial_retry_suffix(task_instruction), model_id, temperature
     )
-    bboxes, grounded_atoms = parse_detect_and_translate_response(response_text, "OpenAI")
-    _normalize_openai_bboxes(bboxes, image.size[0], image.size[1])
+
+
+def _detect_and_translate_structured(
+    image: Image.Image,
+    prompt: str,
+    model_id: str,
+    temperature: float | None,
+) -> tuple[list[dict], list[dict]]:
+    if not _supports_structured_outputs(model_id):
+        raise ValueError(
+            f"Model {model_id!r} does not support Structured Outputs for vision bboxes. "
+            f"Set perception.vlm.model to {DEFAULT_MODEL!r} or gpt-4.1 in tiptop.yml."
+        )
+    client = openai_client()
+    response = client.beta.chat.completions.parse(
+        model=model_id,
+        temperature=temperature,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You detect objects in robot workspace images and translate tasks into predicates. "
+                    "Bounding boxes use a 1000x1000 normalized grid: ymin/xmin are the top-left corner, "
+                    "ymax/xmax are the bottom-right corner. Coordinates are relative to the full image "
+                    "(0=top/left, 1000=bottom/right), not raw pixels."
+                ),
+            },
+            {"role": "user", "content": _vision_user_content(image, prompt)},
+        ],
+        response_format=DetectAndTranslateResponse,
+    )
+    parsed = response.choices[0].message.parsed
+    if parsed is None:
+        refusal = response.choices[0].message.refusal
+        raise RuntimeError(f"OpenAI vision refused or returned empty structured output: {refusal}")
+    bboxes, grounded_atoms = _response_to_bboxes_and_atoms(parsed)
+    _finalize_bboxes(bboxes, image.size[0], image.size[1])
     return bboxes, grounded_atoms
 
 
-def _generate_vision_json(
+async def _detect_and_translate_structured_async(
     image: Image.Image,
     prompt: str,
-    model_id: str = DEFAULT_MODEL,
-    temperature: float | None = 0.0,
-) -> str:
-    client = openai_client()
-    response = client.chat.completions.create(
-        model=model_id,
-        temperature=temperature,
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "user",
-                "content": _image_content(image, prompt),
-            }
-        ],
-    )
-    text = response.choices[0].message.content
-    if not text:
-        raise RuntimeError("OpenAI vision returned an empty response")
-    return text
-
-
-async def _generate_vision_json_async(
-    image: Image.Image,
-    prompt: str,
-    model_id: str = DEFAULT_MODEL,
-    temperature: float | None = 0.0,
-) -> str:
+    model_id: str,
+    temperature: float | None,
+) -> tuple[list[dict], list[dict]]:
+    if not _supports_structured_outputs(model_id):
+        raise ValueError(
+            f"Model {model_id!r} does not support Structured Outputs for vision bboxes. "
+            f"Set perception.vlm.model to {DEFAULT_MODEL!r} or gpt-4.1 in tiptop.yml."
+        )
     client = openai_async_client()
-    response = await client.chat.completions.create(
+    response = await client.beta.chat.completions.parse(
         model=model_id,
         temperature=temperature,
-        response_format={"type": "json_object"},
         messages=[
             {
-                "role": "user",
-                "content": _image_content(image, prompt),
-            }
+                "role": "system",
+                "content": (
+                    "You detect objects in robot workspace images and translate tasks into predicates. "
+                    "Bounding boxes use a 1000x1000 normalized grid: ymin/xmin are the top-left corner, "
+                    "ymax/xmax are the bottom-right corner. Coordinates are relative to the full image "
+                    "(0=top/left, 1000=bottom/right), not raw pixels."
+                ),
+            },
+            {"role": "user", "content": _vision_user_content(image, prompt)},
         ],
+        response_format=DetectAndTranslateResponse,
     )
-    text = response.choices[0].message.content
-    if not text:
-        raise RuntimeError("OpenAI vision returned an empty response")
-    return text
+    parsed = response.choices[0].message.parsed
+    if parsed is None:
+        refusal = response.choices[0].message.refusal
+        raise RuntimeError(f"OpenAI vision refused or returned empty structured output: {refusal}")
+    bboxes, grounded_atoms = _response_to_bboxes_and_atoms(parsed)
+    _finalize_bboxes(bboxes, image.size[0], image.size[1])
+    return bboxes, grounded_atoms
+
+
+def _detect_bboxes_structured(
+    image: Image.Image,
+    prompt: str,
+    model_id: str,
+    temperature: float | None,
+) -> list[dict]:
+    if not _supports_structured_outputs(model_id):
+        raise ValueError(
+            f"Model {model_id!r} does not support Structured Outputs. Use {DEFAULT_MODEL!r} or gpt-4.1."
+        )
+    client = openai_client()
+    response = client.beta.chat.completions.parse(
+        model=model_id,
+        temperature=temperature,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Return bounding boxes on a 1000x1000 grid (ymin, xmin, ymax, xmax). "
+                    "0=top/left, 1000=bottom/right of the image."
+                ),
+            },
+            {"role": "user", "content": _vision_user_content(image, prompt)},
+        ],
+        response_format=BboxListResponse,
+    )
+    parsed = response.choices[0].message.parsed
+    if parsed is None:
+        raise RuntimeError("OpenAI vision returned empty structured bbox response")
+    bboxes = [_structured_bbox_to_dict(b) for b in parsed.bboxes]
+    _finalize_bboxes(bboxes, image.size[0], image.size[1])
+    return bboxes
 
 
 def detect_and_translate(
@@ -198,10 +275,8 @@ def detect_and_translate(
     model_id: str = DEFAULT_MODEL,
     temperature: float | None = 0.0,
 ) -> tuple[list[dict], list[dict]]:
-    prompt = _openai_detect_prompt(image, task_instruction)
-    response_text = _generate_vision_json(image, prompt, model_id=model_id, temperature=temperature)
-    bboxes, grounded_atoms = parse_detect_and_translate_response(response_text, "OpenAI")
-    _normalize_openai_bboxes(bboxes, image.size[0], image.size[1])
+    prompt = _detect_prompt(task_instruction)
+    bboxes, grounded_atoms = _detect_and_translate_structured(image, prompt, model_id, temperature)
     return _maybe_retry_for_containment(
         image, prompt, task_instruction, bboxes, grounded_atoms, model_id, temperature
     )
@@ -213,10 +288,8 @@ async def detect_and_translate_async(
     model_id: str = DEFAULT_MODEL,
     temperature: float | None = 0.0,
 ) -> tuple[list[dict], list[dict]]:
-    prompt = _openai_detect_prompt(image, task_instruction)
-    response_text = await _generate_vision_json_async(image, prompt, model_id=model_id, temperature=temperature)
-    bboxes, grounded_atoms = parse_detect_and_translate_response(response_text, "OpenAI")
-    _normalize_openai_bboxes(bboxes, image.size[0], image.size[1])
+    prompt = _detect_prompt(task_instruction)
+    bboxes, grounded_atoms = await _detect_and_translate_structured_async(image, prompt, model_id, temperature)
     return await _maybe_retry_for_containment_async(
         image, prompt, task_instruction, bboxes, grounded_atoms, model_id, temperature
     )
@@ -228,8 +301,5 @@ def detect_bboxes_with_prompt(
     model_id: str = DEFAULT_MODEL,
     temperature: float | None = 0.0,
 ) -> list:
-    """Run a custom bbox-detection prompt. Returns parsed JSON (list or dict)."""
-    response_text = _generate_vision_json(image, prompt, model_id=model_id, temperature=temperature)
-    result = load_json(response_text)
-    _normalize_openai_bboxes(result, image.size[0], image.size[1])
-    return result
+    """Run a custom bbox-detection prompt. Returns list of bbox dicts."""
+    return _detect_bboxes_structured(image, prompt, model_id, temperature)

@@ -11,7 +11,8 @@ _log = logging.getLogger(__name__)
 
 DEFAULT_MODELS = {
     "gemini": "gemini-robotics-er-1.6-preview",
-    "openai": "gpt-4o",
+    # gpt-4o alias lacks Structured Outputs; dated snapshot or gpt-4.1 required for reliable bboxes.
+    "openai": "gpt-4o-2024-08-06",
 }
 
 
@@ -19,8 +20,8 @@ def get_vlm_settings() -> tuple[str, str]:
     """Return (provider, model) from env overrides or tiptop.yml."""
     cfg = tiptop_cfg()
     vlm_cfg = cfg.perception.vlm if "vlm" in cfg.perception else {}
-    provider = os.environ.get("TIPTOP_VLM_PROVIDER", vlm_cfg.get("provider", "openai")).lower()
-    model = os.environ.get("TIPTOP_VLM_MODEL", vlm_cfg.get("model", DEFAULT_MODELS.get(provider, "gpt-4o")))
+    provider = os.environ.get("TIPTOP_VLM_PROVIDER", vlm_cfg.get("provider", "gemini")).lower()
+    model = os.environ.get("TIPTOP_VLM_MODEL", vlm_cfg.get("model", DEFAULT_MODELS.get(provider, "gemini-robotics-er-1.6-preview")))
     if provider not in DEFAULT_MODELS:
         raise ValueError(f"Unknown VLM provider '{provider}'. Use 'openai' or 'gemini'.")
     return provider, model

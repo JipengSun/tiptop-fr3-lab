@@ -28,6 +28,11 @@ from scipy.spatial import KDTree
 from tiptop.config import load_calibration, tiptop_cfg
 from tiptop.execute_plan import execute_cutamp_plan
 from tiptop.motion_planning import build_curobo_solvers, go_to_capture
+from tiptop.orange_visualization import (
+    orange_grounding_metadata,
+    render_orange_grounding_overlay,
+    save_orange_grounding_visualization,
+)
 from tiptop.perception.cameras import (
     Camera,
     DepthEstimator,
@@ -137,8 +142,10 @@ def get_demo_container(
     if enable_recording:
         if not isinstance(cam, ZedCamera):
             raise NotImplementedError(f"Recording requires a ZED hand camera, got {type(cam).__name__}")
-        if not isinstance(external_cam, ZedCamera):
-            raise NotImplementedError(f"Recording requires a ZED external camera, got {type(external_cam).__name__}")
+        if external_cam is None or not isinstance(external_cam, ZedCamera):
+            raise NotImplementedError(
+                "Recording requires a ZED external camera — plug in external cam or run without --enable-recording"
+            )
 
     # Create depth estimator once — closed over camera intrinsics
     # Cache the SAM2 client
@@ -213,6 +220,8 @@ def _get_task_instruction() -> str:
             ).strip()
             if task_instruction.lower() == "exit":
                 raise UserExitException("User requested exit")
+        except EOFError:
+            raise UserExitException("No stdin available for task instruction (run in an interactive terminal)") from None
         except KeyboardInterrupt:
             raise UserExitException("User interrupted with Ctrl+C")
 
@@ -511,6 +520,26 @@ async def run_perception(
         detection_results["grounded_atoms"], known_labels, task_instruction
     )
 
+    orange_overlay = None
+    orange_grounding = detection_results.get("orange_grounding")
+    if orange_grounding is not None and orange_grounding.selected_label is not None:
+        orange_overlay = render_orange_grounding_overlay(
+            rgb,
+            orange_grounding,
+            grounded_atoms=grounded_atoms,
+        )
+        orange_metadata = orange_grounding_metadata(
+            task_instruction,
+            orange_grounding,
+            grounded_atoms=grounded_atoms,
+        )
+        overlay_path, metadata_path = save_orange_grounding_visualization(
+            save_dir,
+            orange_overlay,
+            orange_metadata,
+        )
+        _log.info(f"Saved orange grounding visualization to {overlay_path} and {metadata_path}")
+
     if log_to_rerun:
         bbox_viz, masks_viz = save_result
         log_perception_to_rerun(
@@ -524,6 +553,8 @@ async def run_perception(
             xyz_map=depth_results["xyz_map"],
             rgb_map=depth_results["rgb_map"],
         )
+        if orange_overlay is not None:
+            rr.log("orange_demo/selection", rr.Image(orange_overlay))
 
     env, all_surfaces = create_tamp_environment(
         processed_scene.object_meshes,
@@ -549,9 +580,20 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 await check_server_health(session)
 
                 # Go to capture pose and ask user for instruction
-                _log.debug("Moving robot to capture joint positions")
-                go_to_capture(time_dilation_factor=cfg.robot.time_dilation_factor, motion_gen=container.motion_gen)
-                container.robot.open_gripper()  # ensure gripper is open
+                _log.info("Moving robot to capture joint positions...")
+                go_to_capture(
+                    time_dilation_factor=cfg.robot.time_dilation_factor,
+                    motion_gen=container.motion_gen,
+                    client=container.robot,
+                )
+                try:
+                    gripper_result = container.robot.open_gripper()
+                    _log.info(f"Gripper open: {gripper_result}")
+                except Exception as e:
+                    _log.warning(f"Gripper open failed (continuing): {e}")
+                    print(f"WARNING: Gripper open failed: {e}\n  Check NUC :5559 and Robotiq USB, then retry.")
+
+                print("\nReady for task — enter a natural-language instruction below.")
                 task_instruction = _get_task_instruction()  # Let UserExitException propagate
                 _log.info(f"User entered instruction: {task_instruction}")
 
@@ -559,7 +601,19 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
                 iso_timestamp = now.isoformat(timespec="seconds")
                 date_str = now.strftime("%Y-%m-%d")
-                rr.init("tiptop_run", recording_id=timestamp, spawn=True)
+                # Rerun viewer from a prior run may have closed — disconnect & retry so the demo continues.
+                try:
+                    rr.init("tiptop_run", recording_id=timestamp, spawn=True)
+                except Exception as e:
+                    _log.warning("Rerun init failed (%s); disconnecting stale viewer and retrying", e)
+                    try:
+                        rr.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        rr.init("tiptop_run", recording_id=timestamp, spawn=True)
+                    except Exception as e2:
+                        _log.warning("Rerun unavailable (%s); continuing without live viewer", e2)
                 # Log workspace for visualization purposes
                 robot_rr = get_robot_rerun()
                 for obj in workspace_cuboids():
@@ -629,6 +683,14 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                             else:
                                 execute_cutamp_plan(cutamp_plan, client=container.robot)
                             _log.info("Finished executing plan!")
+                            # Ensure we end at the wrist-cam capture home (q_capture), not a
+                            # planner intermediate / old tuck neutral.
+                            _log.info("Returning to TiPToP cam/capture home...")
+                            go_to_capture(
+                                time_dilation_factor=cfg.robot.time_dilation_factor,
+                                motion_gen=container.motion_gen,
+                                client=container.robot,
+                            )
                         elif cutamp_plan is not None:
                             _log.info("Skipping cuTAMP plan execution on real robot")
                         else:
@@ -677,8 +739,12 @@ async def async_entrypoint(container: _DemoContainer, config: TAMPConfiguration,
                 if isinstance(e, KeyboardInterrupt):
                     _log.info("Interrupted by user (Ctrl+C)")
                 else:
-                    _log.info("User requested exit")
+                    _log.info(f"Exit: {e}")
                 break
+            except Exception as e:
+                _log.exception("TiPToP failed before/during capture or task prompt")
+                print(f"\nERROR: {e}\n  Try: pixi run go-to-capture   and   pixi run get-joint-positions")
+                raise
 
 
 def _sync_entrypoint(
@@ -742,10 +808,23 @@ def _sync_entrypoint(
     finally:
         if container is not None:
             _log.debug("Tearing down cameras and robot...")
-            container.cam.close()
-            if container.external_cam is not None:
-                container.external_cam.close()
-            container.robot.close()
+            for cam, label in ((container.cam, "hand"), (container.external_cam, "external")):
+                if cam is not None:
+                    try:
+                        cam.close()
+                    except KeyboardInterrupt:
+                        _log.warning(
+                            "Interrupted while closing %s camera — wait a few seconds before restarting "
+                            "(ZED USB may still be releasing)",
+                            label,
+                        )
+                        raise
+                    except Exception as e:
+                        _log.warning("Error closing %s camera: %s", label, e)
+            try:
+                container.robot.close()
+            except Exception as e:
+                _log.warning("Error closing robot client: %s", e)
         if _executor_pool is not None:
             _executor_pool.shutdown(wait=False, cancel_futures=True)
         sys.exit(exit_code)
